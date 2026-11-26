@@ -1,0 +1,99 @@
+name: Build Turnip (Adreno 735 / SD 8s Gen 3)
+
+# Put this file at .github/workflows/build-turnip.yml in your own GitHub repo,
+# then run it from the Actions tab ("Run workflow").
+# UNTESTED: if the build fails, copy the error from the log and fix/ask for help.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_tag:
+        description: "Mesa git tag to build (verify it exists on gitlab.freedesktop.org/mesa/mesa/-/tags)"
+        default: "mesa-26.0.3"
+      sdk:
+        description: "Android platform SDK level"
+        default: "34"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build pkg-config bison flex cmake git zip patchelf \
+            glslang-tools python3-mako python3-yaml python3-ply python3-pycparser python3-packaging
+
+      - name: Clone Mesa
+        run: git clone --depth 1 --branch "${{ inputs.mesa_tag }}" https://gitlab.freedesktop.org/mesa/mesa.git
+
+      - name: Create Android cross file
+        run: |
+          SDK="${{ inputs.sdk }}"
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > mesa/android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['$NDK_BIN/aarch64-linux-android${SDK}-clang']
+          cpp = ['$NDK_BIN/aarch64-linux-android${SDK}-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++']
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+          strip = '$NDK_BIN/llvm-strip'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+      - name: Configure
+        working-directory: mesa
+        run: |
+          meson setup build \
+            --cross-file android-aarch64.txt \
+            --force-fallback-for=zlib,expat,libdrm \
+            -Dbuildtype=release \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=${{ inputs.sdk }} \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Dvulkan-beta=true \
+            -Degl=disabled \
+            -Dgbm=disabled \
+            -Dglx=disabled \
+            -Dllvm=disabled \
+            -Dstrip=true
+
+      - name: Build
+        working-directory: mesa
+        run: ninja -C build src/freedreno/vulkan/libvulkan_freedreno.so
+
+      - name: Package for the app's driver loader
+        run: |
+          mkdir pkg && cd pkg
+          cp ../mesa/build/src/freedreno/vulkan/libvulkan_freedreno.so vulkan.adreno.so
+          patchelf --set-soname vulkan.adreno.so vulkan.adreno.so
+          cat > meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Turnip ${{ inputs.mesa_tag }} (A735)",
+            "description": "Stable Mesa Turnip build, compiled from source.",
+            "author": "me",
+            "packageVersion": "1",
+            "vendor": "Mesa",
+            "driverVersion": "${{ inputs.mesa_tag }}",
+            "minApi": 28,
+            "libraryName": "vulkan.adreno.so"
+          }
+          EOF
+          zip -9 ../turnip-${{ inputs.mesa_tag }}-a735.zip meta.json vulkan.adreno.so
+
+      - name: Upload driver zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip-${{ inputs.mesa_tag }}-a735
+          path: turnip-${{ inputs.mesa_tag }}-a735.zip
